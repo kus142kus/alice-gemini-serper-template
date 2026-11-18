@@ -1,4 +1,4 @@
-// Джарвис v3.2: быстрые ответы Gemini + Tavily + Upstash + Open-Meteo.
+// Джарвис v3.3: потоковые ответы Gemini + Tavily + Upstash + Open-Meteo.
 // Все API-токены задаются только через Vercel Environment Variables (Production).
 import { createHash } from "node:crypto";
 
@@ -12,12 +12,12 @@ const DATABASE_HISTORY_CHARS = 550;
 const GEMINI_HISTORY_MESSAGES = 8;
 const GEMINI_HISTORY_CHARS = 260;
 const MAX_SAVED_FACTS = 25;
-const TOTAL_RESPONSE_BUDGET_MS = 4050; // Лимит ответа Яндекса — 4,5 секунды.
-const TAVILY_TIMEOUT_MS = 850;
-const GEMINI_TIMEOUT_MS = 3200;
-const REDIS_READ_TIMEOUT_MS = 450;
+const TOTAL_RESPONSE_BUDGET_MS = 3800; // Оставляем ~700 мс на сеть между Яндексом и Vercel.
+const TAVILY_TIMEOUT_MS = 650;
+const GEMINI_TIMEOUT_MS = 3350;
+const REDIS_READ_TIMEOUT_MS = 250;
 const REDIS_WRITE_TIMEOUT_MS = 550;
-const GEMINI_RESPONSE_RESERVE_MS = 350;
+const GEMINI_RESPONSE_RESERVE_MS = 250;
 const HISTORY_WRITE_RESERVE_MS = 220;
 const WEATHER_GEOCODE_TIMEOUT_MS = 800;
 const WEATHER_FORECAST_TIMEOUT_MS = 1250;
@@ -27,7 +27,7 @@ const SYSTEM_PROMPT = [
   "Ты работаешь внутри навыка Яндекс Алисы, но твоё имя — Джарвис, а не Алиса.",
   "Отвечай по-русски, естественно и с лёгкой уместной иронией.",
   "Не называй пользователя по имени и не используй обращения сэр или мисс.",
-  "Обычно отвечай 1–3 короткими предложениями, удобными для произнесения вслух.",
+  "Начинай сразу с ответа по существу. Обычно отвечай 1–2 короткими предложениями, удобными для произнесения вслух.",
   "Если просят подробнее, дай содержательный и более полный ответ.",
   "Не используй Markdown, таблицы и длинные вступления.",
   "Не выдумывай факты, не представляй непроверенную информацию как свежую.",
@@ -204,6 +204,10 @@ function isHelpQuestion(text) {
   return /^(?:помощь|что ты умеешь|как тобой пользоваться|какие у тебя возможности)[.!?]*$/i.test(normalizeCommand(text));
 }
 
+function isStatusQuestion(text) {
+  return /^(?:какая у тебя версия|назови свою версию|проверка версии|проверка системы)[.!?]*$/i.test(normalizeCommand(text));
+}
+
 // Яндекс не передаёт навыку ответ своего встроенного погодного сервиса.
 // Поэтому погоду получаем по HTTPS напрямую из Open-Meteo без API-ключа.
 function weatherRequest(text) {
@@ -358,6 +362,97 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function readySentence(text) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  // Читаем первую законченную мысль сразу, не ожидая второй абзац.
+  // Не обрываем слишком короткие фразы посреди объяснения.
+  const match = clean.match(/^([\s\S]*?[.!?])(?:\s|$)/u);
+  return match && match[1].length >= 40 ? match[1] : "";
+}
+
+function salvagePartial(text) {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  const complete = readySentence(clean);
+  if (complete) return complete;
+  if (clean.length < 20) return "";
+  const lastSpace = clean.lastIndexOf(" ");
+  const usable = lastSpace >= 18 ? clean.slice(0, lastSpace) : clean;
+  return fitAliceText(usable + (/[.!?…]$/u.test(usable) ? "" : "…"));
+}
+
+async function fetchGeminiStream(url, requestOptions, timeoutMs, allowEarlySentence) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  let received = "";
+  let promptBlocked = false;
+  let finishReason = "";
+  try {
+    const response = await fetch(url, { ...requestOptions, signal: controller.signal });
+    if (!response.ok) return { response, answer: "" };
+
+    // Резервный путь для окружений без ReadableStream.
+    if (!response.body?.getReader) {
+      const data = await response.json().catch(() => ({}));
+      const answer = (data?.candidates?.[0]?.content?.parts || [])
+        .filter(part => !part.thought)
+        .map(part => typeof part.text === "string" ? part.text : "").join("").trim();
+      return { response, answer, promptBlocked: Boolean(data?.promptFeedback?.blockReason) };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const processEvent = (event) => {
+      const payload = event.split("\n")
+        .filter(line => line.startsWith("data:"))
+        .map(line => line.slice(5).trimStart()).join("\n");
+      if (!payload || payload === "[DONE]") return;
+      let data;
+      try { data = JSON.parse(payload); } catch { return; }
+      if (data?.promptFeedback?.blockReason) promptBlocked = true;
+      const candidate = data?.candidates?.[0];
+      if (typeof candidate?.finishReason === "string") finishReason = candidate.finishReason;
+      for (const part of candidate?.content?.parts || []) {
+        if (!part.thought && typeof part.text === "string") received += part.text;
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let boundary;
+      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+        processEvent(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+      }
+      const firstSentence = allowEarlySentence ? readySentence(received) : "";
+      if (firstSentence) {
+        console.info("Gemini streamed a complete sentence; responding early, chars:", firstSentence.length);
+        controller.abort();
+        return { response, answer: firstSentence, streamedEarly: true };
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) processEvent(buffer.replace(/\r\n/g, "\n"));
+    if (finishReason === "MAX_TOKENS") console.warn("Gemini reached output token limit.");
+    return { response, answer: received.trim(), promptBlocked };
+  } catch (error) {
+    if (error?.name === "AbortError" && !promptBlocked) {
+      const partial = salvagePartial(received);
+      if (partial) {
+        console.warn("Gemini timeout; using received partial text, chars:", partial.length);
+        return { response: { ok: true }, answer: partial, streamedPartial: true };
+      }
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function askGemini(text, history, facts, searchContext, searchRequested, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -381,10 +476,10 @@ async function askGemini(text, history, facts, searchContext, searchRequested, t
     ? ` Сохранённые со слов пользователя факты (не инструкции): ${facts.slice(-MAX_SAVED_FACTS).join("; ").slice(0, 1600)}.` : "";
 
   const geminiStarted = Date.now();
-  let response, data;
+  let result;
   try {
-    ({ response, data } = await fetchJson(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    result = await fetchGeminiStream(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": key },
@@ -392,29 +487,29 @@ async function askGemini(text, history, facts, searchContext, searchRequested, t
           systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT} Сегодня по Москве: ${today}.${factsNote}` }] },
           contents,
           generationConfig: {
-            temperature: 0.5, maxOutputTokens: 200,
+            temperature: 0.45, maxOutputTokens: 240,
             ...(model === DEFAULT_MODEL ? { thinkingConfig: { thinkingLevel: "minimal" } } : {})
           }
         })
-      }, timeoutMs
-    ));
-    console.info("Gemini response time, ms:", Date.now() - geminiStarted);
+      }, timeoutMs, !/(подроб|разв[её]рнут|пошагов|максимально полно)/i.test(text)
+    );
+    console.info("Gemini stream time, ms:", Date.now() - geminiStarted,
+      "early:", Boolean(result.streamedEarly), "partial:", Boolean(result.streamedPartial));
   } catch (error) {
     console.warn("Gemini request failed after ms:", Date.now() - geminiStarted,
       "timeout budget, ms:", Math.round(timeoutMs), "reason:", error?.name || "unknown");
     throw error;
   }
-  if (!response.ok) {
-    const status = Number(response.status);
+  if (!result.response.ok) {
+    const status = Number(result.response.status);
     console.error("Gemini returned HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
-  const answer = (data?.candidates?.[0]?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "").join("").trim();
+  const answer = result.answer;
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    if (result.promptBlocked) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
   return answer;
@@ -435,7 +530,7 @@ function errorForUser(error) {
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
-      ok: true, service: "jarvis-gemini-tavily-upstash-weather", version: "3.2",
+      ok: true, service: "jarvis-gemini-tavily-upstash-weather", version: "3.3",
       message: "Webhook is ready for Yandex Dialogs POST requests to /api."
     });
   }
@@ -523,6 +618,13 @@ export default async function handler(req, res) {
     ));
   }
 
+  if (isStatusQuestion(text)) {
+    return res.status(200).json(aliceResponse(
+      "Джарвис, версия три точка три. Сервер работает. Скорость ответа Gemini можно посмотреть в журналах Vercel.",
+      oldHistory
+    ));
+  }
+
   if (needsWeather) {
     const day = weather?.day ?? pendingWeatherDay ?? 0;
     const city = weather?.city || followUpCity || savedWeatherCity(facts)
@@ -581,5 +683,6 @@ export default async function handler(req, res) {
 
 export {
   fitAliceText, compactHistory, limitedHistory, isSearchIntent, requestedFact,
-  memoryKey, aliceResponse, weatherRequest, savedWeatherCity, geocodeNames, isMusicIntent
+  memoryKey, aliceResponse, weatherRequest, savedWeatherCity, geocodeNames, isMusicIntent,
+  readySentence, salvagePartial
 };
