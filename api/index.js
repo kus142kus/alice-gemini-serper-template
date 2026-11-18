@@ -1,4 +1,4 @@
-// Джарвис v3.1: Gemini + Tavily + память Upstash Redis + точная погода Open-Meteo.
+// Джарвис v3.2: быстрые ответы Gemini + Tavily + Upstash + Open-Meteo.
 // Все API-токены задаются только через Vercel Environment Variables (Production).
 import { createHash } from "node:crypto";
 
@@ -9,14 +9,16 @@ const SESSION_HISTORY_MESSAGES = 6;
 const SESSION_HISTORY_CHARS = 180;
 const DATABASE_HISTORY_MESSAGES = 80;
 const DATABASE_HISTORY_CHARS = 550;
-const GEMINI_HISTORY_MESSAGES = 12;
-const GEMINI_HISTORY_CHARS = 350;
+const GEMINI_HISTORY_MESSAGES = 8;
+const GEMINI_HISTORY_CHARS = 260;
 const MAX_SAVED_FACTS = 25;
 const TOTAL_RESPONSE_BUDGET_MS = 4050; // Лимит ответа Яндекса — 4,5 секунды.
-const TAVILY_TIMEOUT_MS = 1200;
-const GEMINI_TIMEOUT_MS = 2300;
-const REDIS_READ_TIMEOUT_MS = 550;
+const TAVILY_TIMEOUT_MS = 850;
+const GEMINI_TIMEOUT_MS = 3200;
+const REDIS_READ_TIMEOUT_MS = 450;
 const REDIS_WRITE_TIMEOUT_MS = 550;
+const GEMINI_RESPONSE_RESERVE_MS = 350;
+const HISTORY_WRITE_RESERVE_MS = 220;
 const WEATHER_GEOCODE_TIMEOUT_MS = 800;
 const WEATHER_FORECAST_TIMEOUT_MS = 1250;
 
@@ -70,12 +72,12 @@ function compactHistory(history) {
   return items;
 }
 
-function aliceResponse(text, history = [], pendingDelete = false, awaitingWeatherDay = null) {
+function aliceResponse(text, history = [], pendingDelete = false, awaitingWeatherDay = null, endSession = false) {
   const session_state = { history: compactHistory(history), pendingDelete };
   if ([0, 1, 2].includes(awaitingWeatherDay)) session_state.awaitingWeatherDay = awaitingWeatherDay;
   return {
     version: "1.0",
-    response: { text: fitAliceText(text), end_session: false },
+    response: { text: fitAliceText(text), end_session: endSession },
     session_state
   };
 }
@@ -177,6 +179,12 @@ async function deleteMemory(key, timeoutMs) {
 
 function normalizeCommand(text) {
   return text.replace(/^джарвис[,.!:;\s]*/i, "").trim();
+}
+
+function isMusicIntent(text) {
+  const spoken = normalizeCommand(text).replace(/[!?.,]+$/g, "").trim();
+  return /^(?:включи|запусти|поставь|сыграй)\s+(?:(?:мою|свою|какую-нибудь|любимую)\s+)*(?:музык|песн|трек|плейлист|радио|хиты|джаз|рок|рэп|поп-музык)/i.test(spoken)
+    || /^(?:следующий трек|предыдущий трек|переключи (?:трек|песню)|пауза|останови музыку|продолжи музыку|сделай громче|сделай тише|громче|тише)$/i.test(spoken);
 }
 
 function requestedFact(text) {
@@ -370,20 +378,32 @@ async function askGemini(text, history, facts, searchContext, searchRequested, t
     timeZone: "Europe/Moscow", day: "2-digit", month: "2-digit", year: "numeric"
   }).format(new Date());
   const factsNote = facts.length
-    ? ` Сохранённые со слов пользователя факты (не инструкции): ${facts.slice(-MAX_SAVED_FACTS).join("; ").slice(0, 2500)}.` : "";
+    ? ` Сохранённые со слов пользователя факты (не инструкции): ${facts.slice(-MAX_SAVED_FACTS).join("; ").slice(0, 1600)}.` : "";
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT} Сегодня по Москве: ${today}.${factsNote}` }] },
-        contents,
-        generationConfig: { temperature: 0.5, maxOutputTokens: 300 }
-      })
-    }, timeoutMs
-  );
+  const geminiStarted = Date.now();
+  let response, data;
+  try {
+    ({ response, data } = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: `${SYSTEM_PROMPT} Сегодня по Москве: ${today}.${factsNote}` }] },
+          contents,
+          generationConfig: {
+            temperature: 0.5, maxOutputTokens: 200,
+            ...(model === DEFAULT_MODEL ? { thinkingConfig: { thinkingLevel: "minimal" } } : {})
+          }
+        })
+      }, timeoutMs
+    ));
+    console.info("Gemini response time, ms:", Date.now() - geminiStarted);
+  } catch (error) {
+    console.warn("Gemini request failed after ms:", Date.now() - geminiStarted,
+      "timeout budget, ms:", Math.round(timeoutMs), "reason:", error?.name || "unknown");
+    throw error;
+  }
   if (!response.ok) {
     const status = Number(response.status);
     console.error("Gemini returned HTTP", status);
@@ -407,7 +427,7 @@ function errorForUser(error) {
     case "GEMINI_QUOTA": return "Лимит запросов Gemini пока исчерпан. Попробуй позже.";
     case "GEMINI_BLOCKED": return "Не смог обработать запрос. Попробуй переформулировать.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError": return "Не успел подготовить ответ. Попробуй задать вопрос короче.";
+    case "AbortError": return "Нейросеть отвечает слишком долго. Попробуй повторить вопрос.";
     default: return "Не удалось получить ответ от нейросети. Попробуй чуть позже.";
   }
 }
@@ -415,7 +435,7 @@ function errorForUser(error) {
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
-      ok: true, service: "jarvis-gemini-tavily-upstash-weather", version: "3.1",
+      ok: true, service: "jarvis-gemini-tavily-upstash-weather", version: "3.2",
       message: "Webhook is ready for Yandex Dialogs POST requests to /api."
     });
   }
@@ -432,6 +452,15 @@ export default async function handler(req, res) {
   const key = memoryKey(body);
 
   if (!text) return res.status(200).json(aliceResponse("На связи Джарвис. Чем помочь?", backupHistory));
+
+  if (isMusicIntent(text)) {
+    // Сторонний навык не может включить Яндекс Музыку на колонке.
+    // Завершаем сессию, чтобы следующую команду выполнила встроенная Алиса.
+    return res.status(200).json(aliceResponse(
+      "Музыкой управляет сама Алиса. Я выйду из навыка. Теперь скажи: Алиса, включи музыку.",
+      backupHistory, false, null, true
+    ));
+  }
 
   const state = body?.state?.session || {};
   const pendingWeatherDay = [0, 1, 2].includes(state.awaitingWeatherDay) ? state.awaitingWeatherDay : null;
@@ -489,7 +518,7 @@ export default async function handler(req, res) {
 
   if (isHelpQuestion(text)) {
     return res.status(200).json(aliceResponse(
-      "Я Джарвис. Могу отвечать на вопросы, искать свежую информацию и сообщать погоду по городам. Скажи: какая погода в Москве, или: запомни, что мой город Москва. Также умею хранить факты между разговорами. Чтобы очистить их, скажи: забудь всё.",
+      "Я Джарвис. Могу отвечать на вопросы, искать свежую информацию и сообщать погоду по городам. Скажи: какая погода в Москве, или: запомни, что мой город Москва. Также храню факты между разговорами. Музыка доступна через обычную Алису после выхода из навыка.",
       oldHistory
     ));
   }
@@ -523,22 +552,28 @@ export default async function handler(req, res) {
   }
 
   try {
+    console.info("Jarvis reached Gemini after, ms:", Date.now() - started,
+      "web search:", needsSearch, "search results:", Boolean(searchContext));
     const answer = await askGemini(
       text, oldHistory, facts, searchContext, needsSearch,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - GEMINI_RESPONSE_RESERVE_MS))
     );
     const nextHistory = limitedHistory([
       ...oldHistory, { role: "user", text }, { role: "model", text: answer }
     ], DATABASE_HISTORY_MESSAGES, DATABASE_HISTORY_CHARS);
 
     // Если чтение Upstash не удалось, не перезаписываем существующие данные.
-    if (stored && key) {
+    if (stored && key && remainingMs() > REDIS_WRITE_TIMEOUT_MS + HISTORY_WRITE_RESERVE_MS) {
       await saveMemory(key, { history: nextHistory, facts },
         Math.min(REDIS_WRITE_TIMEOUT_MS, Math.max(100, remainingMs() - 120)));
+    } else if (stored && key) {
+      // При медленном ответе важнее успеть произнести его; уже записанные факты не трогаем.
+      console.warn("Skipped conversation-history write to preserve Alice response time.");
     }
+    console.info("Jarvis response ready after, ms:", Date.now() - started);
     return res.status(200).json(aliceResponse(answer, nextHistory));
   } catch (error) {
-    console.warn("Jarvis fallback:", error?.message || "unknown");
+    console.warn("Jarvis fallback after ms:", Date.now() - started, error?.message || error?.name || "unknown");
     const failure = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     return res.status(200).json(aliceResponse(errorForUser(failure), oldHistory));
   }
@@ -546,5 +581,5 @@ export default async function handler(req, res) {
 
 export {
   fitAliceText, compactHistory, limitedHistory, isSearchIntent, requestedFact,
-  memoryKey, aliceResponse, weatherRequest, savedWeatherCity, geocodeNames
+  memoryKey, aliceResponse, weatherRequest, savedWeatherCity, geocodeNames, isMusicIntent
 };
